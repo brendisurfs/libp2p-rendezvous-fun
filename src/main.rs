@@ -1,7 +1,3 @@
-use std::error::Error;
-use std::time::Duration;
-
-use async_std::process;
 use libp2p::futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::rendezvous::client::Behaviour as RendezvousBehaviour;
@@ -12,7 +8,8 @@ use libp2p::{identify, identity};
 use libp2p::{ping, Swarm};
 use libp2p::{rendezvous, NetworkBehaviour};
 use libp2p::{Multiaddr, PeerId};
-use tokio::sync::mpsc;
+use std::error::Error;
+use std::time::Duration;
 use void::Void;
 
 #[derive(Debug)]
@@ -67,7 +64,7 @@ const NAMESPACE: &str = "rendezvous";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     println!("Hello, world!");
-    let rendezvous_namespace = rendezvous::Namespace::new(NAMESPACE.to_string())?;
+    // let rendezvous_namespace = rendezvous::Namespace::new(NAMESPACE.to_string())?;
 
     let rendezvous_point_addr = "/ip4/127.0.0.1/tcp/62649".parse::<Multiaddr>()?;
     let rendezvous_point =
@@ -98,16 +95,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())?;
     swarm.dial(rendezvous_point_addr)?;
 
-    let (tx, mut rx) = mpsc::channel::<Signal>(32);
-
     let mut cookie = None;
-
-    // nice ctrlc handler
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.expect("ctrl c error");
-
-        std::process::exit(1);
-    });
 
     loop {
         match swarm.select_next_some().await {
