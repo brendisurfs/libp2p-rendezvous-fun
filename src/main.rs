@@ -111,6 +111,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         match swarm.select_next_some().await {
+            SwarmEvent::IncomingConnection {
+                local_addr,
+                send_back_addr,
+            } => {
+                println!("incoming: {:?} {:?}", local_addr, send_back_addr);
+            }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 if peer_id == rendezvous_point {
                     println!(
