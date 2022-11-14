@@ -1,3 +1,6 @@
+use libp2p::core::peer_record;
+use libp2p::futures::channel::mpsc;
+use libp2p::futures::SinkExt;
 use libp2p::futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::rendezvous::client::Behaviour as RendezvousBehaviour;
@@ -10,9 +13,12 @@ use libp2p::{rendezvous, NetworkBehaviour};
 use libp2p::{Multiaddr, PeerId};
 use std::error::Error;
 use std::time::Duration;
+use tokio::signal::ctrl_c;
 use void::Void;
 
-#[derive(Debug)]
+// Signals we will eventually use to signal start and stop,
+// for better unregistering from the network.
+#[derive(Debug, PartialEq, PartialOrd)]
 pub enum Signal {
     Running,
     Stop,
@@ -63,8 +69,7 @@ const NAMESPACE: &str = "rendezvous";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    println!("Hello, world!");
-    // let rendezvous_namespace = rendezvous::Namespace::new(NAMESPACE.to_string())?;
+    let rendezvous_namespace = rendezvous::Namespace::new(NAMESPACE.to_string())?;
 
     let rendezvous_point_addr = "/ip4/127.0.0.1/tcp/62649".parse::<Multiaddr>()?;
     let rendezvous_point =
@@ -82,7 +87,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 kp_id.public(),
             )),
             rendezvous: rendezvous::client::Behaviour::new(kp_id.clone()),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(1))),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(10))),
             keep_alive: keep_alive::Behaviour,
         };
         // create peer id
@@ -97,20 +102,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut cookie = None;
 
+    let (mut tx, mut rx) = mpsc::channel::<Signal>(32);
+
+    let mut swarm_tx = tx.clone();
+    let mut signal_tx = tx.clone();
+    // tokio::spawn(async move {
+    //     ctrl_c().await.expect("ctrl c error");
+    //
+    //     signal_tx
+    //         .send(Signal::Stop)
+    //         .await
+    //         .expect("could not send signal");
+    // });
+
     loop {
+        // First, we need to check if a ctrl c has been placed so we can sucessfully de-register.
+        // match rx.select_next_some().await {
+        //     Signal::Stop => {
+        //         println!("\nexiting ... ");
+        //         tokio::time::sleep(Duration::from_secs(1)).await;
+        //         process::exit(1);
+        //     }
+        // If the signal is not stop, keep going.
         match swarm.select_next_some().await {
+            // match any incoming connection.
             SwarmEvent::IncomingConnection {
                 local_addr,
                 send_back_addr,
             } => {
                 println!("incoming: {:?} {:?}", local_addr, send_back_addr);
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+
+            // Handle connection established.
+            // need to start discovering on connection.
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                num_established,
+                ..
+            } => {
                 if peer_id == rendezvous_point {
                     println!(
                         "connected to rendezvous point, discovering nodes in '{}' namespace ... ",
                         NAMESPACE,
                     );
+
+                    println!("number established: {:?}", num_established);
 
                     swarm.behaviour_mut().rendezvous.discover(
                         Some(Namespace::new(NAMESPACE.to_string()).unwrap()),
@@ -121,6 +157,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
+            // If we have a new listener, handle.
             SwarmEvent::NewListenAddr {
                 listener_id,
                 address,
@@ -128,22 +165,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("listener id: {:?} address: {:?}", listener_id, address);
             }
 
-            //
+            // Handle connection closed.
+            // TODO: unregister sometimes doesnt work right. But probably because of my
+            // implementation.
             SwarmEvent::ConnectionClosed {
                 peer_id,
                 cause: Some(error),
                 ..
             } => {
-                println!("connection closed to {:?}. Reason: {:?}", peer_id, error);
-                swarm.behaviour_mut().rendezvous.unregister(
-                    Namespace::new(NAMESPACE.to_string()).unwrap(),
-                    rendezvous_point,
-                );
+                println!("connection closed to {:?}. Reason: {:#?}", peer_id, error);
             }
 
-            // Handle custom events.
+            // Handle MyEvents.
             SwarmEvent::Behaviour(my_event) => {
                 match my_event {
+                    // handle id events.
                     MyEvent::Identify(identify::Event::Sent { peer_id }) => {
                         println!("sent peer id :{:?}", peer_id);
                     }
@@ -156,13 +192,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             None,
                         );
                     }
+                    // handle rendezvous
                     MyEvent::Rendezvous(rendezvous::client::Event::Discovered {
                         registrations,
                         cookie: new_cookie,
                         ..
                     }) => {
                         cookie.replace(new_cookie);
-
                         for reg in registrations {
                             for addr in reg.record.addresses() {
                                 let peer = reg.record.peer_id();
@@ -177,10 +213,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     addr.clone()
                                 };
 
-                                swarm.dial(addr_with_p2p).unwrap()
+                                swarm
+                                    .dial(addr_with_p2p)
+                                    .expect("always able to dial addr with p2p")
                             }
                         }
                     }
+                    // handle any expired peers.
+                    MyEvent::Rendezvous(rendezvous::client::Event::Expired { peer }) => {
+                        println!("peer has expired: {peer:?}");
+                    }
+
                     // on event register
                     MyEvent::Rendezvous(rendezvous::client::Event::Registered {
                         rendezvous_node,
@@ -201,16 +244,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     MyEvent::Ping(ping::Event {
                         peer,
                         result: Ok(ping::Success::Ping { rtt }),
-                    }) if peer != rendezvous_point => {
-                        println!("ping to {} is {}ms", peer, rtt.as_millis());
+                    }) => {
+                        if peer != rendezvous_point {
+                            let peers = swarm
+                                .connected_peers()
+                                .filter(|p| *p != &rendezvous_point)
+                                .collect::<Vec<_>>();
+                            println!("peers: {:#?}", peers.len());
+                            println!("ping to {} is {}ms", peer, rtt.as_millis());
+                        } else {
+                            ()
+                            // println!("pinged rendezvous point: {:?}", peer);
+                        }
                     }
 
                     MyEvent::Ping(ping::Event { peer, result }) => match result {
-                        Ok(success) => (),
-                        Err(why) => println!("error: {why:?}"),
+                        Ok(_) => (),
+                        Err(why) => {
+                            // match the different reasons why we got a ping error.
+                            match why {
+                                ping::Failure::Timeout => {
+                                    println!("ping timeout to {:?}", peer);
+                                    swarm.disconnect_peer_id(peer).expect("disconnect peer");
+                                    println!("disconnected peer due to ping error: {:?}", peer);
+                                }
+                                _ => (),
+                            }
+                            // swarm
+                            //     .behaviour_mut()
+                            //     .rendezvous
+                            //     .unregister(rendezvous_namespace.clone(), rendezvous_point);
+
+                            println!("error: {why:?}");
+                        }
                     },
                     other_event => println!("other: {:?}", other_event),
                 }
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error } => {
+                let err_desc = error.source();
+                println!("error outgoing connection: {:#?}", err_desc);
             }
             other => {
                 println!("unkown: {:?}", other);
